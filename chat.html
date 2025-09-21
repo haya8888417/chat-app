@@ -1,0 +1,297 @@
+// Firebase React Chat — single-file React component + setup
+// Save this as src/App.jsx in a create-react-app (Vite or CRA) project.
+// This app uses Firebase Authentication (Google), Firestore (messages + profiles),
+// and Realtime Database (presence) to show online users and allow 1:1 chat.
+
+/*
+SETUP (summary):
+1) Create a Firebase project at https://console.firebase.google.com
+2) Enable Authentication → Sign-in method → Google
+3) Create Firestore database (in production use proper rules)
+4) Create Realtime Database (for presence)
+5) Add a Web App in Firebase and copy config
+6) Install dependencies: npm install firebase react-router-dom
+7) Put your Firebase config into src/firebase.js or directly below
+8) Run the app (npm run dev / npm start)
+
+Security notes: This is example code. For production, secure Firestore/RTDB rules!
+
+Firestore structure used:
+- users (collection): documents by uid { uid, displayName, photoURL, lastSeen }
+- messages (collection): each conversation stored under doc id = sorted(u1_uid + '_' + u2_uid)
+  messages subcollection: { text, from, to, createdAt }
+
+Realtime Database structure (presence):
+- status/{uid} = { state: 'online'|'offline', last_changed: timestamp }
+
+This single-file example focuses on clarity over full feature completeness.
+*/
+
+import React, { useEffect, useState, useRef } from 'react';
+import { initializeApp } from 'firebase/app';
+import {
+  getAuth,
+  GoogleAuthProvider,
+  signInWithPopup,
+  signOut,
+  onAuthStateChanged,
+} from 'firebase/auth';
+import {
+  getFirestore,
+  collection,
+  doc,
+  setDoc,
+  getDoc,
+  onSnapshot,
+  query,
+  orderBy,
+  addDoc,
+  serverTimestamp,
+} from 'firebase/firestore';
+import { getDatabase, ref as rdbRef, onDisconnect, onValue, set as rdbSet } from 'firebase/database';
+
+// ===== Replace this config with your Firebase project's config =====
+const firebaseConfig = {
+  apiKey: 'REPLACE_ME',
+  authDomain: 'REPLACE_ME.firebaseapp.com',
+  projectId: 'REPLACE_ME',
+  storageBucket: 'REPLACE_ME.appspot.com',
+  messagingSenderId: 'REPLACE_ME',
+  appId: 'REPLACE_ME',
+  databaseURL: 'https://REPLACE_ME-default-rtdb.firebaseio.com',
+};
+// ==================================================================
+
+const app = initializeApp(firebaseConfig);
+const auth = getAuth(app);
+const db = getFirestore(app);
+const rdb = getDatabase(app);
+
+function uidPairId(a, b) {
+  return [a, b].sort().join('_');
+}
+
+export default function App() {
+  const [user, setUser] = useState(null);
+  const [usersList, setUsersList] = useState([]);
+  const [selectedUser, setSelectedUser] = useState(null);
+
+  useEffect(() => {
+    const unsub = onAuthStateChanged(auth, async (u) => {
+      if (u) {
+        const userDocRef = doc(db, 'users', u.uid);
+        await setDoc(userDocRef, {
+          uid: u.uid,
+          displayName: u.displayName || 'No name',
+          photoURL: u.photoURL || null,
+          lastSeen: serverTimestamp(),
+        }, { merge: true });
+        setUser(u);
+        // set presence in RTDB
+        const statusRef = rdbRef(rdb, `status/${u.uid}`);
+        await rdbSet(statusRef, { state: 'online', last_changed: Date.now() });
+        onDisconnect(statusRef).set({ state: 'offline', last_changed: Date.now() });
+      } else {
+        setUser(null);
+      }
+    });
+    return () => unsub();
+  }, []);
+
+  // Listen to users collection and RTDB presence
+  useEffect(() => {
+    const usersCol = collection(db, 'users');
+    const unsubUsers = onSnapshot(usersCol, async (snap) => {
+      const fetched = [];
+      for (const d of snap.docs) {
+        fetched.push(d.data());
+      }
+      // Now merge presence from RTDB
+      const statusRef = rdbRef(rdb, 'status');
+      onValue(statusRef, (snapshot) => {
+        const statusObj = snapshot.val() || {};
+        const merged = fetched.map((u) => ({ ...u, presence: statusObj[u.uid] || { state: 'offline' } }));
+        setUsersList(merged.filter((x) => x.uid !== (user && user.uid)));
+      });
+    });
+    return () => unsubUsers();
+  }, [user]);
+
+  return (
+    <div className="min-h-screen bg-gray-50 p-6 font-sans">
+      <div className="max-w-5xl mx-auto bg-white shadow rounded-lg overflow-hidden grid grid-cols-3">
+        <div className="p-4 border-r">
+          <Header user={user} />
+          <AuthButtons user={user} setUser={setUser} />
+          <h3 className="mt-4 font-semibold">Online Users</h3>
+          <UsersList users={usersList} onSelect={setSelectedUser} selected={selectedUser} />
+        </div>
+        <div className="col-span-2 p-4">
+          {selectedUser ? (
+            <ChatPanel me={user} other={selectedUser} />
+          ) : (
+            <div className="h-full flex items-center justify-center text-gray-400">Select a user to chat</div>
+          )}
+        </div>
+      </div>
+    </div>
+  );
+}
+
+function Header({ user }) {
+  return (
+    <div className="flex items-center gap-3">
+      <h1 className="text-xl font-bold">Firebase Chat</h1>
+      <div className="ml-auto">
+        {user ? (
+          <div className="flex items-center gap-2">
+            <img src={user.photoURL} alt="me" className="w-8 h-8 rounded-full" />
+            <span className="text-sm">{user.displayName}</span>
+          </div>
+        ) : (
+          <span className="text-sm text-gray-500">Not signed in</span>
+        )}
+      </div>
+    </div>
+  );
+}
+
+function AuthButtons({ user }) {
+  const login = async () => {
+    const provider = new GoogleAuthProvider();
+    await signInWithPopup(auth, provider);
+  };
+  const logout = async () => {
+    if (!auth.currentUser) return;
+    // set offline
+    const statusRef = rdbRef(rdb, `status/${auth.currentUser.uid}`);
+    await rdbSet(statusRef, { state: 'offline', last_changed: Date.now() });
+    await signOut(auth);
+  };
+  return (
+    <div className="mt-3">
+      {!user ? (
+        <button onClick={login} className="px-3 py-2 bg-blue-600 text-white rounded">Sign in with Google</button>
+      ) : (
+        <button onClick={logout} className="px-3 py-2 bg-red-500 text-white rounded">Sign out</button>
+      )}
+    </div>
+  );
+}
+
+function UsersList({ users, onSelect, selected }) {
+  return (
+    <div className="mt-3 space-y-2">
+      {users.map((u) => (
+        <div key={u.uid} className={`p-2 rounded cursor-pointer flex items-center justify-between ${selected && selected.uid === u.uid ? 'bg-blue-50' : ''}`} onClick={() => onSelect(u)}>
+          <div className="flex items-center gap-3">
+            <img src={u.photoURL} alt="avatar" className="w-10 h-10 rounded-full" />
+            <div>
+              <div className="font-medium">{u.displayName}</div>
+              <div className="text-xs text-gray-500">{u.presence && u.presence.state === 'online' ? 'Online' : 'Offline'}</div>
+            </div>
+          </div>
+          <div className="text-xs text-gray-400">{u.lastSeen ? new Date(u.lastSeen?.seconds * 1000).toLocaleString() : ''}</div>
+        </div>
+      ))}
+    </div>
+  );
+}
+
+function ChatPanel({ me, other }) {
+  const [messages, setMessages] = useState([]);
+  const [text, setText] = useState('');
+  const bottomRef = useRef();
+
+  useEffect(() => {
+    if (!me || !other) return;
+    const convId = uidPairId(me.uid, other.uid);
+    const messagesCol = collection(doc(collection(db, 'conversations'), convId), 'messages');
+    // Firestore doesn't allow ordering on non-indexed fields automatically in all cases; for demo it's fine.
+    const q = query(messagesCol, orderBy('createdAt'));
+    const unsub = onSnapshot(q, (snap) => {
+      setMessages(snap.docs.map((d) => ({ id: d.id, ...d.data() })));
+      // scroll
+      setTimeout(() => bottomRef.current?.scrollIntoView({ behavior: 'smooth' }), 50);
+    });
+    return () => unsub();
+  }, [me, other]);
+
+  const send = async (e) => {
+    e?.preventDefault();
+    if (!text.trim()) return;
+    const convId = uidPairId(me.uid, other.uid);
+    const messagesColRef = collection(doc(collection(db, 'conversations'), convId), 'messages');
+    await addDoc(messagesColRef, {
+      text: text.trim(),
+      from: me.uid,
+      to: other.uid,
+      createdAt: serverTimestamp(),
+    });
+    setText('');
+  };
+
+  return (
+    <div className="h-[70vh] flex flex-col">
+      <div className="border-b py-2 flex items-center gap-3">
+        <img src={other.photoURL} className="w-10 h-10 rounded-full" />
+        <div>
+          <div className="font-semibold">{other.displayName}</div>
+          <div className="text-xs text-gray-500">{other.presence && other.presence.state === 'online' ? 'Online' : 'Offline'}</div>
+        </div>
+      </div>
+
+      <div className="flex-1 overflow-auto p-3 space-y-3">
+        {messages.map((m) => (
+          <div key={m.id} className={`max-w-[70%] p-2 rounded ${m.from === me.uid ? 'ml-auto bg-blue-100' : 'bg-gray-100'}`}>
+            <div className="text-sm">{m.text}</div>
+            <div className="text-xs text-gray-500 mt-1">{m.createdAt ? new Date(m.createdAt.seconds * 1000).toLocaleTimeString() : ''}</div>
+          </div>
+        ))}
+        <div ref={bottomRef} />
+      </div>
+
+      <form onSubmit={send} className="mt-2 flex gap-2">
+        <input value={text} onChange={(e) => setText(e.target.value)} placeholder="Type a message" className="flex-1 border p-2 rounded" />
+        <button type="submit" className="px-4 py-2 bg-blue-600 text-white rounded">Send</button>
+      </form>
+    </div>
+  );
+}
+
+/*
+FIREBASE RULES (basic examples — adapt for your app):
+
+Firestore (allow read/write only for authenticated users) — in console rules:
+service cloud.firestore {
+  match /databases/{database}/documents {
+    match /users/{userId} {
+      allow read: if request.auth != null;
+      allow write: if request.auth != null && request.auth.uid == userId;
+    }
+    match /conversations/{convId}/messages/{msgId} {
+      allow read: if request.auth != null && (request.auth.uid in get(/databases/$(database)/documents/conversations/$(convId)).data.participants);
+      allow write: if request.auth != null;
+    }
+  }
+}
+
+Realtime DB rules (presence):
+{
+  "rules": {
+    "status": {
+      "$uid": {
+        ".read": "auth != null",
+        ".write": "auth != null && auth.uid == $uid"
+      }
+    }
+  }
+}
+
+Notes & improvements you can ask me for:
+- Searchable/messages pagination
+- Group rooms (not only 1:1)
+- Better offline handling and presence using Cloud Functions + onDisconnect
+- File/image messages (upload to Firebase Storage)
+- Typing indicator
+*/
